@@ -1,0 +1,627 @@
+// RCCP — schema per docs/SPEC.md §2.
+// Canonical enums are docs/SPEC.md §1. Never invent a variant.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+/// DATABASE_URL is the POOLED connection (Neon's "-pooler" host). Serverless
+/// functions open a connection each, so an unpooled URL exhausts Postgres.
+/// DIRECT_URL is the unpooled connection, used only for migrations — PgBouncer
+/// in transaction mode cannot run the DDL and advisory locks migrations need.
+/// Locally, point both at the same database.
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+enum OrgType {
+  RETAILER
+  DISTRIBUTOR
+  MANUFACTURER
+  FACILITY
+  REGULATOR
+}
+
+enum Role {
+  RETAILER
+  DISTRIBUTOR
+  MANUFACTURER
+  FACILITY
+  REGULATOR
+}
+
+enum RegistryStatus {
+  CLEAN
+  IN_RETURN_PIPELINE
+  DESTROYED
+  /// Regulator-imposed. Sale is blocked; the batch has not left the chain.
+  HELD
+  /// Regulator-imposed and stronger: stock must come back off the shelf.
+  RECALLED
+}
+
+enum InventoryStatus {
+  ACTIVE
+  QUARANTINED
+  RETURNED
+}
+
+enum ReturnState {
+  RETURN_DUE
+  INITIATED
+  PICKUP_ASSIGNED
+  DISTRIBUTOR_RECEIVED
+  MANUFACTURER_RECEIVED
+  DISPOSAL_SCHEDULED
+  FACILITY_RECEIVED
+  CERTIFIED_DESTROYED
+}
+
+enum LedgerEvent {
+  ISSUED
+  /// Units leaving an organisation in a transfer. Always written in the same
+  /// transaction as the SUPPLIED row that receives them, so quantity can never
+  /// appear or vanish just because stock changed hands.
+  TRANSFERRED
+  SUPPLIED
+  BILLED
+  RETURN_INITIATED
+  RECEIVED
+  LEAKED
+  DESTROYED
+}
+
+enum ScanContext {
+  SALE
+  RETURN_INTAKE
+  VERIFY
+}
+
+enum ScanVerdict {
+  ALLOW
+  BLOCK
+}
+
+enum Severity {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+enum LeakageStatus {
+  OPEN
+  ACKNOWLEDGED
+  WRITTEN_OFF
+}
+
+enum BillStatus {
+  OK
+  EXPIRED
+}
+
+enum LicensedEntityType {
+  RETAILER
+  WHOLESALER
+}
+
+enum AlertCode {
+  UNKNOWN_BATCH
+  RESURRECTED_BATCH
+  EXPIRED_SALE
+  IN_PIPELINE_SALE
+  QUANTITY_BREACH
+  DOUBLE_RETURN
+  LEAKAGE
+  WEIGHT_MISMATCH
+  BACKDATED_INVOICE
+  CERTIFICATE_OVER_ALLOCATION
+  /// I7. An organisation's derived balance went negative — an accounting
+  /// inconsistency, not by itself proof of fraud.
+  LOCATION_QUANTITY_BREACH
+  /// I8. Stock stuck between lifecycle stages past its stage deadline.
+  STALLED_IN_PIPELINE
+  /// A transfer between two organisations with no authorised route.
+  UNAUTHORIZED_ROUTE
+  RECALLED_SALE
+  HELD_SALE
+  /// Evidence supplied by a member of the public. Never a verdict.
+  CITIZEN_REPORT
+}
+
+enum HoldAction {
+  HOLD_ISSUED
+  RECALL_ISSUED
+  RELEASED
+}
+
+enum CitizenReportReason {
+  SUSPECTED_EXPIRED
+  SUSPECTED_COUNTERFEIT
+  PACKAGING_TAMPERED
+  ADVERSE_REACTION
+  SOLD_AFTER_RECALL
+  OTHER
+}
+
+model Organization {
+  id                  String         @id @default(cuid())
+  name                String
+  type                OrgType
+  licenseNo           String         @unique
+  stateCode           String
+  district            String
+  mappedDistributorId String?
+  mappedDistributor   Organization?  @relation("RetailerDist", fields: [mappedDistributorId], references: [id])
+  retailers           Organization[] @relation("RetailerDist")
+
+  users             User[]
+  products          Product[]       @relation("MfgProducts")
+  batches           Batch[]         @relation("MfgBatches")
+  inventory         Inventory[]
+  ledger            BatchLedger[]
+  returnsAsRetailer ReturnRequest[] @relation("RetRet")
+  returnsAsDistrib  ReturnRequest[] @relation("RetDist")
+  returnsAsMfg      ReturnRequest[] @relation("RetMfg")
+  transfersOut      Transfer[]      @relation("TransferFrom")
+  transfersIn       Transfer[]      @relation("TransferTo")
+  consumerBills     ConsumerBill[]
+  createdAt         DateTime        @default(now())
+}
+
+model User {
+  id             String       @id @default(cuid())
+  email          String       @unique
+  passwordHash   String
+  role           Role
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id])
+}
+
+model Product {
+  id             String       @id @default(cuid())
+  name           String
+  form           String
+  manufacturerId String
+  manufacturer   Organization @relation("MfgProducts", fields: [manufacturerId], references: [id])
+  unitWeightG    Float        @default(0.75)
+  batches        Batch[]
+}
+
+/// Surrogate id + composite unique. Do NOT use a composite primary key:
+/// batch numbers are manufacturer-assigned and collide across manufacturers,
+/// so (manufacturerId, batchNo) must be unique — but a composite PK forces
+/// every relation to carry both columns and costs an hour in Prisma.
+model Batch {
+  id             String         @id @default(cuid())
+  manufacturerId String
+  manufacturer   Organization   @relation("MfgBatches", fields: [manufacturerId], references: [id])
+  batchNo        String
+  productId      String
+  product        Product        @relation(fields: [productId], references: [id])
+  issuedQty      Int
+  mfgDate        DateTime
+  expiryDate     DateTime
+  registryStatus RegistryStatus @default(CLEAN)
+  destroyedAt    DateTime?
+
+  inventory      Inventory[]
+  ledger         BatchLedger[]
+  returns        ReturnRequest[]
+  certificates   DestructionCertificate[]
+  alerts         Alert[]
+  bills          Bill[]
+  transfers      Transfer[]
+  holdOrders     HoldRecallOrder[]
+  billLines      ConsumerBillLine[]
+  citizenReports CitizenReport[]
+
+  @@unique([manufacturerId, batchNo])
+  @@index([expiryDate])
+}
+
+model Inventory {
+  id      String          @id @default(cuid())
+  orgId   String
+  org     Organization    @relation(fields: [orgId], references: [id])
+  batchId String
+  batch   Batch           @relation(fields: [batchId], references: [id])
+  qty     Int
+  status  InventoryStatus @default(ACTIVE)
+
+  @@unique([orgId, batchId])
+}
+
+/// APPEND ONLY. Never UPDATE, never DELETE. All balances are SUMs over this table.
+/// qtyDelta is always a positive magnitude; the event type carries the direction.
+model BatchLedger {
+  id        BigInt       @id @default(autoincrement())
+  batchId   String
+  batch     Batch        @relation(fields: [batchId], references: [id])
+  orgId     String
+  org       Organization @relation(fields: [orgId], references: [id])
+  eventType LedgerEvent
+  qtyDelta  Int
+  refType   String?
+  refId     String?
+  serverTs  DateTime     @default(now())
+
+  @@index([batchId, eventType])
+  @@index([orgId, batchId, eventType])
+}
+
+model ReturnRequest {
+  id             String       @id @default(cuid())
+  batchId        String
+  batch          Batch        @relation(fields: [batchId], references: [id])
+  retailerId     String
+  retailer       Organization @relation("RetRet", fields: [retailerId], references: [id])
+  distributorId  String
+  distributor    Organization @relation("RetDist", fields: [distributorId], references: [id])
+  manufacturerId String
+  manufacturer   Organization @relation("RetMfg", fields: [manufacturerId], references: [id])
+
+  state ReturnState @default(RETURN_DUE)
+  dueBy DateTime
+
+  declaredQty Int?
+  condition   String?
+  photoUrl    String?
+  initiatedAt DateTime?
+
+  pickupAt DateTime?
+
+  distReceivedQty Int?
+  distWeightG     Float?
+  distPhotoUrl    String?
+  distReceivedAt  DateTime?
+
+  mfgReceivedQty Int?
+  mfgReceivedAt  DateTime?
+
+  /// min() of confirmed quantities along the chain. The certificate ceiling
+  /// is computed from this, never from declaredQty.
+  confirmedQty Int?
+
+  leakage   LeakageRecord[]
+  disposals DisposalRequest[]
+  bills     Bill[]
+  createdAt DateTime          @default(now())
+  updatedAt DateTime          @updatedAt
+
+  @@index([state])
+  @@index([dueBy])
+}
+
+/// Created whenever received < declared. NEVER auto-closed.
+/// An OPEN LeakageRecord is the correct end state, not an unfinished feature.
+model LeakageRecord {
+  id          String        @id @default(cuid())
+  returnId    String
+  return      ReturnRequest @relation(fields: [returnId], references: [id])
+  batchId     String
+  fromOrgId   String
+  toOrgId     String
+  declaredQty Int
+  receivedQty Int
+  leakedQty   Int
+  status      LeakageStatus @default(OPEN)
+  note        String?
+  createdAt   DateTime      @default(now())
+
+  @@index([status])
+  @@index([fromOrgId])
+}
+
+model DisposalRequest {
+  id                 String                   @id @default(cuid())
+  returnId           String
+  return             ReturnRequest            @relation(fields: [returnId], references: [id])
+  batchId            String
+  manufacturerId     String
+  facilityId         String
+  qty                Int
+  scheduledDate      DateTime
+  facilityReceivedAt DateTime?
+  certificates       DestructionCertificate[]
+  createdAt          DateTime                 @default(now())
+}
+
+model DestructionCertificate {
+  id                String          @id @default(cuid())
+  certNo            String          @unique
+  disposalRequestId String
+  disposalRequest   DisposalRequest @relation(fields: [disposalRequestId], references: [id])
+  batchId           String
+  batch             Batch           @relation(fields: [batchId], references: [id])
+  facilityId        String
+  qty               Int
+  issuedAt          DateTime        @default(now())
+}
+
+model PosScan {
+  id                 String      @id @default(cuid())
+  orgId              String
+  rawManufacturerRef String
+  rawBatchNo         String
+  batchId            String?
+  qty                Int
+  context            ScanContext
+  /// client-supplied, NOT authoritative
+  claimedInvoiceDate DateTime?
+  verdict            ScanVerdict
+  alertCode          AlertCode?
+  serverTs           DateTime    @default(now())
+}
+
+model Alert {
+  id               String    @id @default(cuid())
+  code             AlertCode
+  severity         Severity
+  batchId          String?
+  batch            Batch?    @relation(fields: [batchId], references: [id])
+  orgId            String?
+  payload          Json
+  acknowledgedById String?
+  acknowledgedAt   DateTime?
+  createdAt        DateTime  @default(now())
+
+  @@index([severity, createdAt])
+}
+
+/// Hash chain proves the digital record was not altered after the fact.
+/// It does NOT prove physical destruction occurred. Keep that caveat visible in the UI.
+model AuditEvent {
+  id            BigInt           @id @default(autoincrement())
+  entityType    String
+  entityId      String
+  action        String
+  actorUserId   String?
+  actorOrgId    String?
+  payload       Json
+  prevHash      String?
+  hash          String
+  serverTs      DateTime         @default(now())
+  bill          Bill?
+  holdOrder     HoldRecallOrder?
+  citizenReport CitizenReport?
+
+  @@index([entityType, entityId])
+}
+
+/// COMPLIANCE RECEIPT — not an invoice. It has no price, amount or currency, and
+/// never will. It documents, per batch, whether that stock is OK or EXPIRED and
+/// why, at the moment a decision was made.
+///
+/// PERMANENT. Created only, never updated and never deleted, by any code path.
+/// A correction is a NEW Bill plus a new AuditEvent, never a mutation of the
+/// original — the same discipline BatchLedger follows.
+///
+/// A Bill never decides anything. It is generated FROM an invariant/lifecycle
+/// outcome and cannot influence one (CLAUDE.md rule 1).
+model Bill {
+  id String @id @default(cuid())
+
+  /// Null for a bill raised by a POS decision, which is not tied to a return.
+  /// Set for every bill raised by a return lifecycle transition.
+  returnRequestId String?
+  returnRequest   ReturnRequest? @relation(fields: [returnRequestId], references: [id])
+
+  batchId String
+  batch   Batch  @relation(fields: [batchId], references: [id])
+
+  quantity    Int
+  generatedAt DateTime   @default(now())
+  status      BillStatus
+
+  /// Invariant identifiers behind the status, e.g. ["I1"], ["I2"],
+  /// ["REUSED_DESTROYED"]. Empty for an OK bill.
+  anomalyCodes String[]
+
+  /// Plain-language explanation shown to staff and to the public on /verify.
+  anomalyNote String?
+
+  /// One bill per audit event — the audit row is what makes the bill provable.
+  auditEventId BigInt     @unique
+  auditEvent   AuditEvent @relation(fields: [auditEventId], references: [id])
+
+  @@index([batchId, generatedAt])
+  @@index([status, generatedAt])
+}
+
+/// CDSCO Not-of-Standard-Quality alert. EXTERNAL ground truth, import-only:
+/// nothing in the app writes here except scripts/import-cdsco.mjs.
+///
+/// This is a SEPARATE signal from Bill status. A batch can be OK in RCCP's own
+/// ledger and still be CDSCO-recalled on quality, or vice versa. The two answer
+/// different questions and are never merged into one status.
+model NsqAlert {
+  id           String   @id @default(cuid())
+  medicineName String
+  batchNo      String
+  dateFlagged  DateTime
+  reason       String
+  source       String   @default("CDSCO")
+  importedAt   DateTime @default(now())
+
+  /// Upsert key. Deliberately NOT batchNo alone: batch numbers collide across
+  /// manufacturers, which is the premise the whole system is built on
+  /// (CLAUDE.md rule 6). Keying on batchNo alone would let one maker's recall
+  /// silently overwrite another's.
+  @@unique([medicineName, batchNo])
+  @@index([batchNo])
+}
+
+/// CDSCO licensed-entity register. Import-only, as above.
+model LicensedEntity {
+  id         String             @id @default(cuid())
+  name       String
+  licenseNo  String             @unique
+  type       LicensedEntityType
+  state      String
+  /// As published by CDSCO: ACTIVE, SUSPENDED, EXPIRED, ...
+  status     String
+  importedAt DateTime           @default(now())
+
+  @@index([status])
+}
+
+model IdempotencyKey {
+  key            String   @id
+  userId         String
+  endpoint       String
+  requestHash    String
+  responseStatus Int
+  responseBody   Json
+  createdAt      DateTime @default(now())
+}
+
+/// A movement of stock between two organisations.
+///
+/// Every transfer writes TWO ledger rows in one transaction: TRANSFERRED against
+/// the sender and SUPPLIED against the receiver, both carrying this row's id as
+/// refId. That pairing is what makes quantity conservation checkable across a
+/// change of custody — without it, stock that leaves one shelf and never arrives
+/// at another is invisible rather than a breach.
+model Transfer {
+  id        String       @id @default(cuid())
+  fromOrgId String
+  fromOrg   Organization @relation("TransferFrom", fields: [fromOrgId], references: [id])
+  toOrgId   String
+  toOrg     Organization @relation("TransferTo", fields: [toOrgId], references: [id])
+  batchId   String
+  batch     Batch        @relation(fields: [batchId], references: [id])
+  qty       Int
+
+  /// False when no AuthorizedRoute covers (fromOrgId, toOrgId). The transfer is
+  /// still recorded — refusing to record it would only push the movement off the
+  /// books, which is the opposite of what the ledger is for. An UNAUTHORIZED_ROUTE
+  /// alert is raised alongside.
+  authorized Boolean  @default(true)
+  note       String?
+  serverTs   DateTime @default(now())
+
+  @@index([batchId])
+  @@index([fromOrgId, batchId])
+  @@index([toOrgId, batchId])
+}
+
+/// The authorised distribution network: manufacturer -> distributor -> retailer.
+///
+/// Deliberately SEPARATE from CDSCO licensing. An entity can hold a valid CDSCO
+/// licence and still not be an authorised route for a given manufacturer's stock;
+/// the two facts answer different questions and are never merged.
+model AuthorizedRoute {
+  id        String   @id @default(cuid())
+  fromOrgId String
+  toOrgId   String
+  createdAt DateTime @default(now())
+
+  @@unique([fromOrgId, toOrgId])
+  @@index([fromOrgId])
+}
+
+/// A regulator's emergency action on a batch, and the only way one is released.
+///
+/// PERMANENT and append-only, like Bill. A release is a NEW row referencing the
+/// order it lifts, never an edit or deletion of the original — so a batch can
+/// never quietly travel RECALLED -> CLEAN with no trace of who allowed it.
+model HoldRecallOrder {
+  id      String     @id @default(cuid())
+  batchId String
+  batch   Batch      @relation(fields: [batchId], references: [id])
+  action  HoldAction
+  reason  String
+
+  issuedByUserId String
+  issuedByOrgId  String
+
+  /// Set only on a RELEASED row: the order being lifted.
+  releasesId String?
+
+  auditEventId BigInt     @unique
+  auditEvent   AuditEvent @relation(fields: [auditEventId], references: [id])
+  createdAt    DateTime   @default(now())
+
+  @@index([batchId, createdAt])
+}
+
+/// CONSUMER PURCHASE RECEIPT — a different thing from the compliance `Bill`.
+///
+///   Bill          = permanent regulatory record: is this stock OK or EXPIRED, and why.
+///   ConsumerBill  = what a person actually bought, so they can verify it later.
+///
+/// They are never merged and never substituted for one another. This one carries
+/// no price either: RCCP is not a billing system, and a receipt that carried money
+/// would invite someone to treat it as one.
+model ConsumerBill {
+  id     String @id @default(cuid())
+  billNo String @unique
+
+  /// The opaque value in the QR URL. Random, not the primary key and not derived
+  /// from it: a sequential id in a public URL lets anyone walk every purchase.
+  token String @unique
+
+  pharmacyId String
+  pharmacy   Organization @relation(fields: [pharmacyId], references: [id])
+  soldAt     DateTime     @default(now())
+
+  lines     ConsumerBillLine[]
+  createdAt DateTime           @default(now())
+
+  @@index([pharmacyId, soldAt])
+}
+
+/// One dispensed medicine. Multiple lines from different manufacturers and
+/// batches may sit on one bill; qty 1 is a first-class case, not an edge case.
+model ConsumerBillLine {
+  id             String       @id @default(cuid())
+  consumerBillId String
+  consumerBill   ConsumerBill @relation(fields: [consumerBillId], references: [id])
+  batchId        String
+  batch          Batch        @relation(fields: [batchId], references: [id])
+
+  /// Snapshot of what was on the pack at the moment of sale. Kept verbatim rather
+  /// than re-read through the relation: this is evidence of what the consumer was
+  /// handed, and it must not silently change if a record is corrected later.
+  productName           String
+  manufacturerName      String
+  manufacturerLicenseNo String
+  batchNo               String
+  expiryDate            DateTime
+
+  qty       Int
+  posScanId String?
+
+  @@index([consumerBillId])
+  @@index([batchId])
+}
+
+/// A report from a member of the public.
+///
+/// EVIDENCE, never a verdict. It is recorded and surfaced to the regulator; it
+/// never mutates batch state, and nothing downstream may treat it as proof.
+model CitizenReport {
+  /// Null when the reported batch does not resolve. An unreadable or invented
+  /// batch number is the single most important report to keep — rejecting the
+  /// report for failing to match would discard exactly the counterfeit signal.
+  batchId String?
+  batch   Batch?  @relation(fields: [batchId], references: [id])
+
+  id                 String              @id @default(cuid())
+  rawManufacturerRef String
+  rawBatchNo         String
+  reason             CitizenReportReason
+  description        String?
+  pharmacyLicenseNo  String?
+  location           String?
+
+  auditEventId BigInt     @unique
+  auditEvent   AuditEvent @relation(fields: [auditEventId], references: [id])
+  createdAt    DateTime   @default(now())
+
+  @@index([createdAt])
+  @@index([batchId])
+}
